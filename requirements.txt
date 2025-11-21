@@ -1,0 +1,33 @@
+# Core Web Framework
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+aiofiles>=23.2.1
+starlette>=0.27.0
+click
+h11
+websockets
+watchfiles
+
+# YouTube Download
+yt-dlp>=2024.1.0
+
+# Cloud AI Client
+httpx>=0.25.2
+
+# Video Processing
+ffmpeg-python>=0.2.0
+moviepy>=1.0.3
+pillow>=10.1.0
+
+# Audio Analysis
+librosa>=0.10.1
+pydub>=0.25.1
+soundfile>=0.12.1
+
+# Utilities
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+numpy>=1.23.0,<2.0.0
+sentence-splitter
+omegaconf

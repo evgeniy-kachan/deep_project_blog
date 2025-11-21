@@ -1,0 +1,621 @@
+"""Video processing service for cutting, adding audio and subtitles."""
+import ffmpeg
+import json
+import logging
+from pathlib import Path
+from typing import List, Dict, Tuple, Literal
+import subprocess
+import uuid
+
+logger = logging.getLogger(__name__)
+
+
+class VideoProcessor:
+    """Process video segments: cut, add TTS audio, add stylized subtitles."""
+    
+    # Target dimensions for Reels/Shorts (9:16 aspect ratio)
+    TARGET_WIDTH = 1080
+    TARGET_HEIGHT = 1920
+    
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+    def cut_segment(
+        self,
+        video_path: str,
+        start_time: float,
+        end_time: float,
+        output_path: str
+    ) -> str:
+        """
+        Cut a segment from video.
+        
+        Args:
+            video_path: Path to source video
+            start_time: Start time in seconds
+            end_time: End time in seconds
+            output_path: Path for output video
+            
+        Returns:
+            Path to cut video
+        """
+        try:
+            logger.info(f"Cutting segment: {start_time:.2f}s - {end_time:.2f}s")
+            
+            duration = end_time - start_time
+            
+            # Use ffmpeg to cut video precisely
+            (
+                ffmpeg
+                .input(video_path, ss=start_time, t=duration)
+                .output(
+                    output_path,
+                    codec='copy',  # Copy without re-encoding for speed
+                    avoid_negative_ts='make_zero'
+                )
+                .overwrite_output()
+                .run(quiet=True, capture_stdout=True, capture_stderr=True)
+            )
+            
+            logger.info(f"Segment saved to: {output_path}")
+            return output_path
+            
+        except ffmpeg.Error as e:
+            logger.error(f"FFmpeg error: {e.stderr.decode()}")
+            raise
+    
+    def convert_to_vertical(
+        self,
+        video_path: str,
+        output_path: str,
+        method: Literal["blur_background", "center_crop", "smart_crop"] = "blur_background"
+    ) -> str:
+        """
+        Convert horizontal video to vertical format (9:16) for Reels/Shorts.
+        
+        Args:
+            video_path: Path to input video
+            output_path: Path for output video
+            method: Conversion method:
+                - "blur_background": Video centered with blurred background
+                - "center_crop": Simple center crop
+                - "smart_crop": Crop with face detection (if available)
+                
+        Returns:
+            Path to converted video
+        """
+        try:
+            logger.info(f"Converting to vertical format using method: {method}")
+            
+            # Get video dimensions
+            probe = ffmpeg.probe(video_path)
+            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+            input_width = int(video_info['width'])
+            input_height = int(video_info['height'])
+            
+            # Check if already vertical
+            if input_height > input_width:
+                logger.info("Video is already vertical, skipping conversion")
+                # Just resize to target dimensions
+                (
+                    ffmpeg
+                    .input(video_path)
+                    .filter('scale', self.TARGET_WIDTH, self.TARGET_HEIGHT)
+                    .output(output_path, **{'c:v': 'libx264', 'preset': 'medium'})
+                    .overwrite_output()
+                    .run(quiet=True, capture_stdout=True, capture_stderr=True)
+                )
+                return output_path
+            
+            if method == "blur_background":
+                try:
+                    # Popular method: video in center with blurred background
+                    # Create blurred background
+                    background = (
+                        ffmpeg.input(video_path)
+                        .filter('scale', self.TARGET_WIDTH, self.TARGET_HEIGHT, force_original_aspect_ratio='increase')
+                        .filter('crop', self.TARGET_WIDTH, self.TARGET_HEIGHT)
+                        .filter('boxblur', 'luma_radius=20:chroma_radius=20')
+                    )
+                    
+                    # Create scaled video for center
+                    video = (
+                        ffmpeg.input(video_path)
+                        .filter('scale', self.TARGET_WIDTH, self.TARGET_HEIGHT, force_original_aspect_ratio='decrease')
+                    )
+                    
+                    # Overlay video on blurred background
+                    (
+                        ffmpeg
+                        .overlay(background, video, x='(W-w)/2', y='(H-h)/2')
+                        .output(output_path, **{'c:v': 'libx264', 'preset': 'medium', 'crf': 23})
+                        .overwrite_output()
+                        .run(quiet=True, capture_stdout=True, capture_stderr=True)
+                    )
+                except ffmpeg.Error as e:
+                    logger.warning("Blur background conversion failed, falling back to center crop")
+                    logger.warning(e.stderr.decode(errors="ignore") if e.stderr else str(e))
+                    return self.convert_to_vertical(video_path, output_path, method="center_crop")
+                
+            elif method == "center_crop":
+                # Simple center crop
+                (
+                    ffmpeg
+                    .input(video_path)
+                    .filter('scale', -1, self.TARGET_HEIGHT)
+                    .filter('crop', self.TARGET_WIDTH, self.TARGET_HEIGHT)
+                    .output(output_path, **{'c:v': 'libx264', 'preset': 'medium'})
+                    .overwrite_output()
+                    .run(quiet=True, capture_stdout=True, capture_stderr=True)
+                )
+                
+            elif method == "smart_crop":
+                # Smart crop with face detection (requires ffmpeg with libopencv)
+                # Fallback to center crop if face detection not available
+                try:
+                    (
+                        ffmpeg
+                        .input(video_path)
+                        .filter('scale', -1, self.TARGET_HEIGHT)
+                        .filter('crop', self.TARGET_WIDTH, self.TARGET_HEIGHT, x='(iw-ow)/2', y='(ih-oh)/2')
+                        .output(output_path, **{'c:v': 'libx264', 'preset': 'medium'})
+                        .overwrite_output()
+                        .run(quiet=True, capture_stdout=True, capture_stderr=True)
+                    )
+                except:
+                    logger.warning("Smart crop not available, falling back to center crop")
+                    return self.convert_to_vertical(video_path, output_path, method="center_crop")
+            
+            logger.info(f"Converted video to vertical format: {output_path}")
+            return output_path
+            
+        except ffmpeg.Error as e:
+            logger.error(f"FFmpeg error converting to vertical: {e.stderr.decode(errors='ignore') if e.stderr else str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Error converting to vertical: {e}", exc_info=True)
+            raise
+    
+    def add_audio_and_subtitles(
+        self,
+        video_path: str,
+        audio_path: str,
+        subtitles: List[Dict],
+        output_path: str,
+        style: str = "capcut",
+        convert_to_vertical: bool = True,
+        vertical_method: str = "blur_background"
+    ) -> str:
+        """
+        Add TTS audio and stylized subtitles to video.
+        
+        Args:
+            video_path: Path to video file
+            audio_path: Path to TTS audio file
+            subtitles: List of subtitle entries with word-level timing
+            output_path: Path for output video
+            style: Subtitle style ("tiktok", "instagram", "youtube")
+            convert_to_vertical: Whether to convert to vertical format (9:16)
+            vertical_method: Method for vertical conversion
+            
+        Returns:
+            Path to processed video
+        """
+        try:
+            logger.info(f"Adding audio and subtitles to video")
+            
+            # Step 1: Convert to vertical if needed
+            working_video = video_path
+            if convert_to_vertical:
+                temp_vertical = Path(output_path).parent / f"{Path(output_path).stem}_vertical_temp.mp4"
+                working_video = self.convert_to_vertical(
+                    video_path, 
+                    str(temp_vertical),
+                    method=vertical_method
+                )
+            
+            # Step 2: Create ASS subtitle file with styling
+            subtitle_path = Path(output_path).with_suffix('.ass')
+            self._create_stylized_subtitles(subtitles, subtitle_path, style)
+            
+            # Step 3: Process video with ffmpeg
+            # Replace audio with TTS and burn in stylized subtitles
+            video_input = ffmpeg.input(working_video)
+            audio_input = ffmpeg.input(audio_path)
+            
+            output = (
+                ffmpeg
+                .output(
+                    video_input.video,
+                    audio_input.audio,
+                    output_path,
+                    vf=f"ass={subtitle_path}",
+                    shortest=None,  # Use shortest stream
+                    **{'c:v': 'libx264', 'c:a': 'aac', 'b:a': '192k', 'preset': 'medium', 'crf': 23}
+                )
+                .overwrite_output()
+            )
+            
+            output.run(quiet=True, capture_stdout=True, capture_stderr=True)
+            
+            logger.info(f"Processed video saved to: {output_path}")
+            
+            # Clean up temporary files
+            subtitle_path.unlink(missing_ok=True)
+            if convert_to_vertical and working_video != video_path:
+                Path(working_video).unlink(missing_ok=True)
+            
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error processing video: {e}")
+            raise
+
+    def create_vertical_video(
+        self,
+        video_path: str,
+        audio_path: str,
+        text: str,
+        start_time: float,
+        end_time: float,
+        method: Literal["blur_background", "center_crop", "smart_crop"] = "blur_background",
+        subtitle_lines: list[str] | None = None,
+    ) -> str:
+        """
+        End-to-end helper that cuts the source video, converts it to vertical format,
+        overlays subtitles and replaces audio with synthesized TTS.
+        Returns path to the processed temporary file.
+        """
+        try:
+            duration = max(0.1, end_time - start_time)
+            temp_segment = self.output_dir / f"segment_cut_{uuid.uuid4().hex}.mp4"
+            temp_output = self.output_dir / f"segment_processed_{uuid.uuid4().hex}.mp4"
+
+            # Step 1: cut source segment
+            cut_path = self.cut_segment(
+                video_path=video_path,
+                start_time=start_time,
+                end_time=end_time,
+                output_path=str(temp_segment)
+            )
+
+            # Step 2: prepare basic subtitles
+            subtitles = self._generate_basic_subtitles(
+                text=text,
+                duration=duration,
+                preferred_lines=subtitle_lines,
+            )
+
+            # Step 3: add audio + subtitles + vertical conversion
+            processed_path = self.add_audio_and_subtitles(
+                video_path=cut_path,
+                audio_path=audio_path,
+                subtitles=subtitles,
+                output_path=str(temp_output),
+                convert_to_vertical=True,
+                vertical_method=method
+            )
+
+            return processed_path
+
+        finally:
+            # Clean up intermediate cut segment
+            if 'temp_segment' in locals():
+                Path(temp_segment).unlink(missing_ok=True)
+
+    def save_video(self, processed_path: str, output_path: str) -> str:
+        """
+        Move processed temporary video into its final location.
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        Path(processed_path).replace(output_path)
+        logger.info(f"Final video saved to: {output_path}")
+        return str(output_path)
+
+    def _generate_basic_subtitles(
+        self,
+        text: str,
+        duration: float,
+        max_words_per_line: int = 6,
+        preferred_lines: list[str] | None = None,
+    ) -> List[Dict]:
+        """
+        Create a multi-line subtitle track with approximate word-level timings.
+        Each subtitle line contains up to `max_words_per_line` words so the viewer
+        sees a few words at a time, synchronized with the TTS audio.
+        """
+        cleaned_text = " ".join((text or "").strip().split())
+        if not cleaned_text and not preferred_lines:
+            cleaned_text = "..."
+
+        word_chunks: List[List[str]] = []
+
+        if preferred_lines:
+            for line in preferred_lines:
+                tokens = line.strip().split()
+                if tokens:
+                    word_chunks.append(tokens)
+
+        if not word_chunks:
+            words = cleaned_text.split(" ")
+            total_words = len(words)
+            if total_words == 0:
+                words = ["..."]
+                total_words = 1
+
+            current_chunk: List[str] = []
+            for word in words:
+                current_chunk.append(word)
+                if len(current_chunk) >= max_words_per_line:
+                    word_chunks.append(current_chunk)
+                    current_chunk = []
+
+            if current_chunk:
+                word_chunks.append(current_chunk)
+
+        total_words = sum(len(chunk) for chunk in word_chunks) or 1
+
+        subtitles: List[Dict] = []
+        elapsed = 0.0
+
+        for chunk in word_chunks:
+            chunk_word_count = len(chunk)
+            # Allocate duration proportionally to number of words in chunk
+            chunk_duration = duration * (chunk_word_count / total_words)
+            # Ensure last chunk ends exactly at total duration
+            if chunk is word_chunks[-1]:
+                chunk_duration = max(0.05, duration - elapsed)
+
+            start_time = elapsed
+            end_time = min(duration, start_time + chunk_duration)
+            elapsed = end_time
+
+            # Word-level timings within the chunk
+            word_entries = []
+            if chunk_word_count == 0:
+                chunk_word_count = 1
+
+            per_word = chunk_duration / chunk_word_count if chunk_duration > 0 else 0
+            for index, word in enumerate(chunk):
+                word_start = start_time + index * per_word
+                word_end = min(end_time, word_start + per_word)
+                word_entries.append({
+                    'word': word,
+                    'start': word_start,
+                    'end': word_end
+                })
+
+            subtitles.append({
+                'start': start_time,
+                'end': end_time,
+                'text': " ".join(chunk),
+                'words': word_entries
+            })
+
+        # Guard: if due to rounding we didn't cover the entire duration,
+        # extend the last subtitle slightly
+        if subtitles and subtitles[-1]['end'] < duration:
+            subtitles[-1]['end'] = duration
+            if subtitles[-1]['words']:
+                subtitles[-1]['words'][-1]['end'] = duration
+
+        return subtitles
+    
+    def _create_stylized_subtitles(
+        self,
+        subtitles: List[Dict],
+        output_path: Path,
+        style: str = "tiktok"
+    ):
+        """
+        Create ASS subtitle file with TikTok/Instagram style.
+        
+        Subtitles format:
+        [
+            {
+                'start': 0.5,
+                'end': 1.2,
+                'text': 'Привет',
+                'words': [
+                    {'word': 'Привет', 'start': 0.5, 'end': 1.2}
+                ]
+            },
+            ...
+        ]
+        """
+        # ASS subtitle styles
+        styles = {
+            'capcut': {
+                'fontname': 'Montserrat',
+                'fontsize': 86,
+                'primarycolor': '&H00FFFFFF',
+                'outlinecolor': '&H00FFFFFF',
+                'borderstyle': 1,
+                'outline': 0,
+                'shadow': 4,
+                'alignment': 8,  # centered upper area
+                'marginv': 450,  # slightly lower
+            },
+            'tiktok': {
+                'fontname': 'Arial',
+                'fontsize': 56,
+                'primarycolor': '&H00FFFFFF',  # White fill
+                'outlinecolor': '&H00FFFFFF',  # Same as fill
+                'borderstyle': 1,
+                'outline': 0,
+                'shadow': 3,
+                'alignment': 2,  # Bottom center
+                'marginv': 90,
+            },
+            'instagram': {
+                'fontname': 'Arial',
+                'fontsize': 48,
+                'primarycolor': '&H00FFFFFF',
+                'outlinecolor': '&H00FFFFFF',
+                'borderstyle': 1,
+                'outline': 0,
+                'shadow': 3,
+                'alignment': 2,
+                'marginv': 80,
+            },
+            'youtube': {
+                'fontname': 'Arial',
+                'fontsize': 42,
+                'primarycolor': '&H00FFFFFF',
+                'outlinecolor': '&H00FFFFFF',
+                'borderstyle': 1,
+                'outline': 0,
+                'shadow': 3,
+                'alignment': 2,
+                'marginv': 70,
+            }
+        }
+        
+        selected_style = styles.get(style, styles['tiktok'])
+        
+        # Create ASS file
+        ass_content = f"""[Script Info]
+Title: Generated Subtitles
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{selected_style['fontname']},{selected_style['fontsize']},{selected_style['primarycolor']},&H000000FF,{selected_style['outlinecolor']},&H00000000,-1,0,0,0,100,100,0,0,{selected_style['borderstyle']},{selected_style['outline']},{selected_style['shadow']},{selected_style['alignment']},10,10,{selected_style['marginv']},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+        
+        # Add subtitle events
+        for subtitle in subtitles:
+            start_time = self._format_timestamp(subtitle['start'])
+            end_time = self._format_timestamp(subtitle['end'])
+            text = subtitle['text'].replace('\n', '\\N')
+            
+            # Add word-by-word highlighting if available
+            if 'words' in subtitle and subtitle['words']:
+                if style == 'capcut':
+                    text = self._build_capcut_line(subtitle)
+                else:
+                    text = self._add_word_effects(subtitle['words'])
+            
+            ass_content += f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{text}\n"
+        
+        # Write to file
+        output_path.write_text(ass_content, encoding='utf-8')
+        
+    def _format_timestamp(self, seconds: float) -> str:
+        """Convert seconds to ASS timestamp format (H:MM:SS.CS)."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        centiseconds = int((seconds % 1) * 100)
+        return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+    
+    def _add_word_effects(self, words: List[Dict]) -> str:
+        """
+        Add CapCut-like pop animation for each subtitle chunk.
+        Words are grouped per chunk upstream; we animate the whole chunk so it
+        appears slightly below the center with a bounce + fade in.
+        """
+        if not words:
+            return ""
+
+        tokens = [w['word'] for w in words]
+
+        # break into two lines for readability if chunk is long
+        if len(tokens) >= 4:
+            split_index = len(tokens) // 2
+            text = " ".join(tokens[:split_index]) + r"\N" + " ".join(tokens[split_index:])
+        else:
+            text = " ".join(tokens)
+
+        # CapCut style animation: fade + scale bounce
+        effect_tag = (
+            r"{\an8\pos(540,1250)\fad(80,40)"
+            r"\alpha&HFF"
+            r"\t(0,160,\alpha&H00\fscx120\fscy120)"
+            r"\t(160,320,\fscx100\fscy100)}"
+        )
+
+        return f"{effect_tag}{text}"
+
+    def _build_capcut_line(self, subtitle: Dict) -> str:
+        """Animate each word sequentially so it 'pops' in and stays visible."""
+        words = subtitle.get('words', [])
+        if not words:
+            return ""
+
+        chunk_start = subtitle.get('start', 0.0)
+        chunk_end = subtitle.get('end', chunk_start)
+        chunk_duration = max(0.01, chunk_end - chunk_start)
+
+        base_tag = r"{\an8\pos(540,1250)\fad(80,40)}"
+        rendered = [base_tag]
+
+        tokens = []
+        for idx, word in enumerate(words):
+            rel_start = max(0.0, (word.get('start', chunk_start) - chunk_start) * 1000)
+            rel_end = max(rel_start + 200.0, (word.get('end', chunk_start) - chunk_start) * 1000)
+            highlight_start = int(rel_start)
+            highlight_mid = int(min(rel_start + 160.0, chunk_duration * 1000))
+            highlight_end = int(min(rel_end, chunk_duration * 1000))
+
+            tag = (
+                r"{\alpha&HFF"
+                rf"\t({highlight_start},{highlight_mid},\alpha&H00\fscx118\fscy118)"
+                rf"\t({highlight_mid},{highlight_end},\fscx100\fscy100)}}"
+            )
+
+            word_text = word.get('word', '')
+            if idx != len(words) - 1:
+                word_text += " "
+
+            tokens.append(f"{tag}{word_text}")
+
+        # Insert line break roughly in the middle for readability
+        if len(tokens) >= 6:
+            split_index = len(tokens) // 2
+            tokens.insert(split_index, r"\N")
+
+        rendered.append(" ".join(tokens).replace(" \\N ", r"\N"))
+        return "".join(rendered)
+    
+    def extract_audio(self, video_path: str, output_path: str) -> str:
+        """Extract audio from video."""
+        try:
+            (
+                ffmpeg
+                .input(video_path)
+                .output(output_path, acodec='pcm_s16le', ac=1, ar='16000')
+                .overwrite_output()
+                .run(quiet=True, capture_stdout=True, capture_stderr=True)
+            )
+            return output_path
+        except Exception as e:
+            logger.error(f"Error extracting audio: {e}")
+            raise
+    
+    def get_video_info(self, video_path: str) -> Dict:
+        """Get video metadata."""
+        try:
+            probe = ffmpeg.probe(video_path)
+            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+            audio_info = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
+            
+            return {
+                'duration': float(probe['format']['duration']),
+                'width': int(video_info['width']),
+                'height': int(video_info['height']),
+                'fps': eval(video_info['r_frame_rate']),
+                'has_audio': audio_info is not None
+            }
+        except Exception as e:
+            logger.error(f"Error getting video info: {e}")
+            raise
+
